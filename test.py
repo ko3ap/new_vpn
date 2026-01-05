@@ -11,9 +11,9 @@ from pathlib import Path
 # =====================
 
 WG_INTERFACE = "wg0"
-WG_DIR = "./clients"            # куда сохранять конфиги
-SERVER_PUBLIC_KEY = "PASTE_SERVER_PUBLIC_KEY_HERE"
-SERVER_ENDPOINT = "1.2.3.4:51820"
+WG_DIR = "./clients"            # куда сохраgjxtveнять конфиги
+SERVER_PUBLIC_KEY = "k6pj+BXTWet6eN9WpANyIFDKYyID0PYp6cokrToev0Q="
+SERVER_ENDPOINT = "79.132.143.147:51820"
 SERVER_DNS = "1.1.1.1"
 TXT_DIR = "./keys_txt"         # куда сохранять .txt в формате vpn://<base64>
 CLIENTS_DB = Path(WG_DIR) / "clients.json"
@@ -56,10 +56,99 @@ def save_clients(data):
 # =====================
 
 def generate_keys():
-    private_key = run("wg genkey")
-    # wg pubkey expects the private key on stdin; echoing it is fine for shell
-    public_key = run(f"echo {private_key} | wg pubkey")
+    # Generate private key
+    try:
+        private_key = subprocess.check_output(["wg", "genkey"]).decode().strip()
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate private key: {e}")
+
+    # Generate public key from private key using stdin (safe)
+    try:
+        proc = subprocess.run(["wg", "pubkey"], input=private_key.encode(), capture_output=True)
+        public_key = proc.stdout.decode().strip()
+        if not public_key:
+            raise RuntimeError(proc.stderr.decode().strip())
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate public key: {e}")
+
     return private_key, public_key
+
+
+def get_default_interface():
+    try:
+        out = run("ip route show default")
+        # example: 'default via 192.0.2.1 dev eth0 proto dhcp metric 100'
+        parts = out.split()
+        if 'dev' in parts:
+            idx = parts.index('dev')
+            return parts[idx + 1]
+    except Exception:
+        pass
+    return None
+
+
+def enable_ipv4_forwarding():
+    try:
+        Path('/proc/sys/net/ipv4/ip_forward').write_text('1')
+    except Exception:
+        try:
+            run('sysctl -w net.ipv4.ip_forward=1')
+        except Exception as e:
+            print(f"Не удалось включить ip_forward: {e}")
+
+
+def add_masquerade_rule(ip: str):
+    ext_if = get_default_interface()
+    if not ext_if:
+        print("Не удалось определить внешний интерфейс для MASQUERADE; настройте вручную")
+        return
+
+    # ensure ip forwarding enabled
+    enable_ipv4_forwarding()
+
+    # NAT rule
+    try:
+        run(f"iptables -t nat -C POSTROUTING -s {ip}/32 -o {ext_if} -j MASQUERADE")
+    except Exception:
+        try:
+            run(f"iptables -t nat -A POSTROUTING -s {ip}/32 -o {ext_if} -j MASQUERADE")
+        except Exception as e:
+            print(f"Не удалось добавить MASQUERADE: {e}")
+
+    # FORWARD allow
+    try:
+        run(f"iptables -C FORWARD -i {WG_INTERFACE} -o {ext_if} -j ACCEPT")
+    except Exception:
+        try:
+            run(f"iptables -A FORWARD -i {WG_INTERFACE} -o {ext_if} -j ACCEPT")
+        except Exception as e:
+            print(f"Не удалось добавить правило FORWARD (out): {e}")
+
+    try:
+        run(f"iptables -C FORWARD -i {ext_if} -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
+    except Exception:
+        try:
+            run(f"iptables -A FORWARD -i {ext_if} -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
+        except Exception as e:
+            print(f"Не удалось добавить правило FORWARD (in): {e}")
+
+
+def remove_masquerade_rule(ip: str):
+    ext_if = get_default_interface()
+    if not ext_if:
+        return
+    try:
+        run(f"iptables -t nat -D POSTROUTING -s {ip}/32 -o {ext_if} -j MASQUERADE")
+    except Exception:
+        pass
+    try:
+        run(f"iptables -D FORWARD -i {WG_INTERFACE} -o {ext_if} -j ACCEPT")
+    except Exception:
+        pass
+    try:
+        run(f"iptables -D FORWARD -i {ext_if} -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
+    except Exception:
+        pass
 
 
 # =====================
@@ -172,6 +261,11 @@ def create_user(client_name: str, ip_index: int):
     private_key, public_key = generate_keys()
 
     add_peer(public_key, ip)
+    # Настроим NAT и форвардинг для этого клиента, чтобы трафик выходил в интернет
+    try:
+        add_masquerade_rule(ip)
+    except Exception as e:
+        print(f"Ошибка при настройке NAT: {e}")
     config_path, config_text = generate_client_config(
         client_name,
         private_key,
@@ -205,6 +299,11 @@ def freeze_peer_by_pubkey(pubkey: str):
         if info.get('public_key') == pubkey:
             ip = info.get('ip')
             block_ip(ip)
+            # Удаляем NAT для этого клиента, если было
+            try:
+                remove_masquerade_rule(ip)
+            except Exception:
+                pass
             info['frozen'] = True
             save_clients(clients)
             print(f"{name} ({ip}) заморожен")
@@ -219,6 +318,10 @@ def unfreeze_peer_by_pubkey(pubkey: str):
         if info.get('public_key') == pubkey:
             ip = info.get('ip')
             unblock_ip(ip)
+            try:
+                add_masquerade_rule(ip)
+            except Exception:
+                pass
             info['frozen'] = False
             save_clients(clients)
             print(f"{name} ({ip}) разморожен")
