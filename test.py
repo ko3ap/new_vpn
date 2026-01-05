@@ -2,6 +2,7 @@ import subprocess
 import os
 import json
 import base64
+import random
 import argparse
 from pathlib import Path
 
@@ -106,15 +107,45 @@ def generate_client_config(
     private_key: str,
     ip: str
 ):
+    # Generate preshared key for extra security
+    try:
+        preshared = run("wg genpsk")
+    except Exception:
+        # fallback: random 32 bytes base64
+        preshared = base64.b64encode(os.urandom(32)).decode()
+
+    # Additional metadata fields (matching provided template)
+    J = random.randint(1, 10)
+    Jmin = random.randint(5, 15)
+    Jmax = random.randint(30, 80)
+    S1 = random.randint(50, 150)
+    S2 = random.randint(100, 200)
+    H1 = random.randint(1_000_000_000, 2_000_000_000)
+    H2 = random.randint(1_000_000, 20_000_000)
+    H3 = random.randint(1, 999_999_999)
+    H4 = random.randint(1, 999_999_999)
+
+    dns_field = f"{SERVER_DNS}, 1.0.0.1" if SERVER_DNS else "1.1.1.1, 1.0.0.1"
+
     config = f"""[Interface]
-PrivateKey = {private_key}
 Address = {ip}/32
-DNS = {SERVER_DNS}
+DNS = {dns_field}
+PrivateKey = {private_key}
+J = {J}
+Jmin = {Jmin}
+Jmax = {Jmax}
+S1 = {S1}
+S2 = {S2}
+H1 = {H1}
+H2 = {H2}
+H3 = {H3}
+H4 = {H4}
 
 [Peer]
 PublicKey = {SERVER_PUBLIC_KEY}
+PresharedKey = {preshared}
+AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = {SERVER_ENDPOINT}
-AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 """
 
@@ -124,11 +155,9 @@ PersistentKeepalive = 25
 
 
 def save_txt_uri(client_name: str, config_text: str):
-    # Кодируем конфиг в URL-safe base64 и убираем padding
-    b64 = base64.urlsafe_b64encode(config_text.encode()).decode().rstrip('=')
-    uri = f"vpn://{b64}"
+    # Сохраняем конфиг в .txt в том же формате, что и в примере
     path = Path(TXT_DIR) / f"{client_name}.txt"
-    path.write_text(uri)
+    path.write_text(config_text)
     return path
 
 
