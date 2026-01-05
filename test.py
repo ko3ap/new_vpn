@@ -157,9 +157,12 @@ def remove_masquerade_rule(ip: str):
 
 def add_peer(public_key: str, ip: str):
     try:
+        # Ensure peer has exactly the client's IP allowed (replace previous allowed-ips)
         run(f"wg set {WG_INTERFACE} peer {public_key} allowed-ips {ip}/32")
+        # also ensure NAT/forwarding for this client
+        add_masquerade_rule(ip)
     except Exception as e:
-        print(f"Не удалось добавить peer: {e}")
+        print(f"Не удалось добавить/обновить peer: {e}")
 
 
 def remove_peer(public_key: str):
@@ -291,6 +294,26 @@ def create_user(client_name: str, ip_index: int):
     print("Public key:", public_key)
     print("Config:", config_path)
     print("TXT:", txt_path)
+
+
+def repair_all_clients():
+    """Применяет правильные allowed-ips и NAT/forward для всех клиентов из clients.json"""
+    clients = load_clients()
+    if not clients:
+        print("Нет клиентов в clients.json")
+        return
+    for name, info in clients.items():
+        pub = info.get('public_key')
+        ip = info.get('ip')
+        if not pub or not ip:
+            print(f"Пропускаю {name}, нет pub/ip")
+            continue
+        try:
+            run(f"wg set {WG_INTERFACE} peer {pub} allowed-ips {ip}/32")
+            add_masquerade_rule(ip)
+            print(f"Обновлён {name}: {pub} -> {ip}")
+        except Exception as e:
+            print(f"Ошибка при ремонте {name}: {e}")
 
 
 def freeze_peer_by_pubkey(pubkey: str):
