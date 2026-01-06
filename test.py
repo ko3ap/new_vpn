@@ -74,6 +74,16 @@ def generate_keys():
     return private_key, public_key
 
 
+def ensure_wg_up():
+    try:
+        run(f"wg show {WG_INTERFACE}")
+    except Exception:
+        try:
+            run(f"wg-quick up {WG_INTERFACE}")
+        except Exception as e:
+            print(f"Не удалось поднять интерфейс {WG_INTERFACE}: {e}")
+
+
 def get_default_interface():
     try:
         out = run("ip route show default")
@@ -97,58 +107,36 @@ def enable_ipv4_forwarding():
             print(f"Не удалось включить ip_forward: {e}")
 
 
-def add_masquerade_rule(ip: str):
+def setup_nat_once():
+    """Добавляет одну MASQUERADE для подсети и правила FORWARD (идемпотентно)."""
     ext_if = get_default_interface()
     if not ext_if:
-        print("Не удалось определить внешний интерфейс для MASQUERADE; настройте вручную")
+        print("Не удалось определить внешний интерфейс; настройте NAT вручную")
         return
-
-    # ensure ip forwarding enabled
     enable_ipv4_forwarding()
-
-    # NAT rule
+    subnet = f"{BASE_IP}0/24"
     try:
-        run(f"iptables -t nat -C POSTROUTING -s {ip}/32 -o {ext_if} -j MASQUERADE")
+        run(f"iptables -t nat -C POSTROUTING -s {subnet} -o {ext_if} -j MASQUERADE")
     except Exception:
         try:
-            run(f"iptables -t nat -A POSTROUTING -s {ip}/32 -o {ext_if} -j MASQUERADE")
+            run(f"iptables -t nat -A POSTROUTING -s {subnet} -o {ext_if} -j MASQUERADE")
+            print(f"Добавлен MASQUERADE для {subnet} -> {ext_if}")
         except Exception as e:
             print(f"Не удалось добавить MASQUERADE: {e}")
-
-    # FORWARD allow
     try:
-        run(f"iptables -C FORWARD -i {WG_INTERFACE} -o {ext_if} -j ACCEPT")
+        run(f"iptables -C FORWARD -i {WG_INTERFACE} -j ACCEPT")
     except Exception:
         try:
-            run(f"iptables -A FORWARD -i {WG_INTERFACE} -o {ext_if} -j ACCEPT")
+            run(f"iptables -A FORWARD -i {WG_INTERFACE} -j ACCEPT")
         except Exception as e:
             print(f"Не удалось добавить правило FORWARD (out): {e}")
-
     try:
-        run(f"iptables -C FORWARD -i {ext_if} -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
+        run(f"iptables -C FORWARD -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
     except Exception:
         try:
-            run(f"iptables -A FORWARD -i {ext_if} -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
+            run(f"iptables -A FORWARD -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
         except Exception as e:
             print(f"Не удалось добавить правило FORWARD (in): {e}")
-
-
-def remove_masquerade_rule(ip: str):
-    ext_if = get_default_interface()
-    if not ext_if:
-        return
-    try:
-        run(f"iptables -t nat -D POSTROUTING -s {ip}/32 -o {ext_if} -j MASQUERADE")
-    except Exception:
-        pass
-    try:
-        run(f"iptables -D FORWARD -i {WG_INTERFACE} -o {ext_if} -j ACCEPT")
-    except Exception:
-        pass
-    try:
-        run(f"iptables -D FORWARD -i {ext_if} -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
-    except Exception:
-        pass
 
 
 # =====================
@@ -157,10 +145,9 @@ def remove_masquerade_rule(ip: str):
 
 def add_peer(public_key: str, ip: str):
     try:
+        ensure_wg_up()
         # Ensure peer has exactly the client's IP allowed (replace previous allowed-ips)
         run(f"wg set {WG_INTERFACE} peer {public_key} allowed-ips {ip}/32")
-        # also ensure NAT/forwarding for this client
-        add_masquerade_rule(ip)
     except Exception as e:
         print(f"Не удалось добавить/обновить peer: {e}")
 
@@ -203,35 +190,15 @@ def generate_client_config(
     try:
         preshared = run("wg genpsk")
     except Exception:
-        # fallback: random 32 bytes base64
         preshared = base64.b64encode(os.urandom(32)).decode()
 
-    # Additional metadata fields (matching provided template)
-    J = random.randint(1, 10)
-    Jmin = random.randint(5, 15)
-    Jmax = random.randint(30, 80)
-    S1 = random.randint(50, 150)
-    S2 = random.randint(100, 200)
-    H1 = random.randint(1_000_000_000, 2_000_000_000)
-    H2 = random.randint(1_000_000, 20_000_000)
-    H3 = random.randint(1, 999_999_999)
-    H4 = random.randint(1, 999_999_999)
+    dns_field = SERVER_DNS if SERVER_DNS else "1.1.1.1"
 
-    dns_field = f"{SERVER_DNS}, 1.0.0.1" if SERVER_DNS else "1.1.1.1, 1.0.0.1"
-
+    # Minimal standard WireGuard client config (no custom fields)
     config = f"""[Interface]
+PrivateKey = {private_key}
 Address = {ip}/32
 DNS = {dns_field}
-PrivateKey = {private_key}
-J = {J}
-Jmin = {Jmin}
-Jmax = {Jmax}
-S1 = {S1}
-S2 = {S2}
-H1 = {H1}
-H2 = {H2}
-H3 = {H3}
-H4 = {H4}
 
 [Peer]
 PublicKey = {SERVER_PUBLIC_KEY}
@@ -262,13 +229,7 @@ def create_user(client_name: str, ip_index: int):
 
     ip = f"{BASE_IP}{ip_index}"
     private_key, public_key = generate_keys()
-
     add_peer(public_key, ip)
-    # Настроим NAT и форвардинг для этого клиента, чтобы трафик выходил в интернет
-    try:
-        add_masquerade_rule(ip)
-    except Exception as e:
-        print(f"Ошибка при настройке NAT: {e}")
     config_path, config_text = generate_client_config(
         client_name,
         private_key,
@@ -282,7 +243,6 @@ def create_user(client_name: str, ip_index: int):
     clients[client_name] = {
         'ip': ip,
         'public_key': public_key,
-        'private_key': private_key,
         'config_path': str(config_path),
         'txt_path': str(txt_path),
         'frozen': False
@@ -309,8 +269,8 @@ def repair_all_clients():
             print(f"Пропускаю {name}, нет pub/ip")
             continue
         try:
+            ensure_wg_up()
             run(f"wg set {WG_INTERFACE} peer {pub} allowed-ips {ip}/32")
-            add_masquerade_rule(ip)
             print(f"Обновлён {name}: {pub} -> {ip}")
         except Exception as e:
             print(f"Ошибка при ремонте {name}: {e}")
@@ -322,11 +282,7 @@ def freeze_peer_by_pubkey(pubkey: str):
         if info.get('public_key') == pubkey:
             ip = info.get('ip')
             block_ip(ip)
-            # Удаляем NAT для этого клиента, если было
-            try:
-                remove_masquerade_rule(ip)
-            except Exception:
-                pass
+            # NAT для подсети настройте один раз через 'setup-nat'
             info['frozen'] = True
             save_clients(clients)
             print(f"{name} ({ip}) заморожен")
@@ -341,10 +297,6 @@ def unfreeze_peer_by_pubkey(pubkey: str):
         if info.get('public_key') == pubkey:
             ip = info.get('ip')
             unblock_ip(ip)
-            try:
-                add_masquerade_rule(ip)
-            except Exception:
-                pass
             info['frozen'] = False
             save_clients(clients)
             print(f"{name} ({ip}) разморожен")
@@ -402,6 +354,7 @@ if __name__ == "__main__":
     unfreeze_group.add_argument('--name')
 
     repair = sub.add_parser('repair')
+    setup = sub.add_parser('setup-nat')
 
     args = parser.parse_args()
 
@@ -409,6 +362,8 @@ if __name__ == "__main__":
         create_user(args.name, args.ip_index)
     elif args.cmd == 'repair':
         repair_all_clients()
+    elif args.cmd == 'setup-nat':
+        setup_nat_once()
     elif args.cmd == 'freeze':
         if args.pubkey:
             freeze_peer_by_pubkey(args.pubkey)
