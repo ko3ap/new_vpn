@@ -1,117 +1,423 @@
 import subprocess
-import json
 import os
-from pathlib import Path
-import argparse
+import json
 import base64
+import random
+import argparse
+from pathlib import Path
+
+# =====================
+# НАСТРОЙКИ
+# =====================
 
 WG_INTERFACE = "wg0"
-WG_DIR = "./clients"
-CLIENTS_DB = Path(WG_DIR) / "clients.json"
-
+WG_DIR = "./clients"            # куда сохраgjxtveнять конфиги
 SERVER_PUBLIC_KEY = "k6pj+BXTWet6eN9WpANyIFDKYyID0PYp6cokrToev0Q="
 SERVER_ENDPOINT = "79.132.143.147:51820"
 SERVER_DNS = "1.1.1.1"
+TXT_DIR = "./keys_txt"         # куда сохранять .txt в формате vpn://<base64>
+CLIENTS_DB = Path(WG_DIR) / "clients.json"
 
-BASE_IP = "10.0.0."
-START_IP = 2
-
-
-# ---------------- UTILS ----------------
-
-def run(cmd):
-    return subprocess.check_output(cmd, shell=True).decode().strip()
+BASE_IP = "10.0.0."              # пул IP
+START_IP = 2                     # первый IP для клиентов
 
 
-def ensure_dirs():
-    Path(WG_DIR).mkdir(exist_ok=True)
+# =====================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =====================
+
+def run(cmd: str) -> str:
+    try:
+        return subprocess.check_output(cmd, shell=True).decode().strip()
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Command failed: {cmd}\n{e}")
+
+
+def ensure_dir():
+    Path(WG_DIR).mkdir(parents=True, exist_ok=True)
+    Path(TXT_DIR).mkdir(parents=True, exist_ok=True)
 
 
 def load_clients():
-    if CLIENTS_DB.exists():
-        return json.loads(CLIENTS_DB.read_text())
-    return {}
+    try:
+        if CLIENTS_DB.exists():
+            return json.loads(CLIENTS_DB.read_text())
+        return {}
+    except Exception:
+        return {}
 
 
 def save_clients(data):
-    CLIENTS_DB.write_text(json.dumps(data, indent=2))
+    CLIENTS_DB.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-# ---------------- KEYS ----------------
+# =====================
+# ГЕНЕРАЦИЯ КЛЮЧЕЙ
+# =====================
 
 def generate_keys():
-    private_key = run("wg genkey")
-    public_key = run(f"echo {private_key} | wg pubkey")
-    preshared = run("wg genpsk")
-    return private_key, public_key, preshared
+    # Generate private key
+    try:
+        private_key = subprocess.check_output(["wg", "genkey"]).decode().strip()
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate private key: {e}")
+
+    # Generate public key from private key using stdin (safe)
+    try:
+        proc = subprocess.run(["wg", "pubkey"], input=private_key.encode(), capture_output=True)
+        public_key = proc.stdout.decode().strip()
+        if not public_key:
+            raise RuntimeError(proc.stderr.decode().strip())
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate public key: {e}")
+
+    return private_key, public_key
 
 
-# ---------------- WG ----------------
+def get_default_interface():
+    try:
+        out = run("ip route show default")
+        # example: 'default via 192.0.2.1 dev eth0 proto dhcp metric 100'
+        parts = out.split()
+        if 'dev' in parts:
+            idx = parts.index('dev')
+            return parts[idx + 1]
+    except Exception:
+        pass
+    return None
 
-def add_peer(pubkey, ip):
-    run(f"wg set {WG_INTERFACE} peer {pubkey} allowed-ips {ip}/32")
+
+def enable_ipv4_forwarding():
+    try:
+        Path('/proc/sys/net/ipv4/ip_forward').write_text('1')
+    except Exception:
+        try:
+            run('sysctl -w net.ipv4.ip_forward=1')
+        except Exception as e:
+            print(f"Не удалось включить ip_forward: {e}")
 
 
-# ---------------- CONFIG ----------------
+def add_masquerade_rule(ip: str):
+    ext_if = get_default_interface()
+    if not ext_if:
+        print("Не удалось определить внешний интерфейс для MASQUERADE; настройте вручную")
+        return
 
-def generate_client_conf(name, private, psk, ip):
-    conf = f"""[Interface]
-PrivateKey = {private}
+    # ensure ip forwarding enabled
+    enable_ipv4_forwarding()
+
+    # NAT rule
+    try:
+        run(f"iptables -t nat -C POSTROUTING -s {ip}/32 -o {ext_if} -j MASQUERADE")
+    except Exception:
+        try:
+            run(f"iptables -t nat -A POSTROUTING -s {ip}/32 -o {ext_if} -j MASQUERADE")
+        except Exception as e:
+            print(f"Не удалось добавить MASQUERADE: {e}")
+
+    # FORWARD allow
+    try:
+        run(f"iptables -C FORWARD -i {WG_INTERFACE} -o {ext_if} -j ACCEPT")
+    except Exception:
+        try:
+            run(f"iptables -A FORWARD -i {WG_INTERFACE} -o {ext_if} -j ACCEPT")
+        except Exception as e:
+            print(f"Не удалось добавить правило FORWARD (out): {e}")
+
+    try:
+        run(f"iptables -C FORWARD -i {ext_if} -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
+    except Exception:
+        try:
+            run(f"iptables -A FORWARD -i {ext_if} -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
+        except Exception as e:
+            print(f"Не удалось добавить правило FORWARD (in): {e}")
+
+
+def remove_masquerade_rule(ip: str):
+    ext_if = get_default_interface()
+    if not ext_if:
+        return
+    try:
+        run(f"iptables -t nat -D POSTROUTING -s {ip}/32 -o {ext_if} -j MASQUERADE")
+    except Exception:
+        pass
+    try:
+        run(f"iptables -D FORWARD -i {WG_INTERFACE} -o {ext_if} -j ACCEPT")
+    except Exception:
+        pass
+    try:
+        run(f"iptables -D FORWARD -i {ext_if} -o {WG_INTERFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT")
+    except Exception:
+        pass
+
+
+# =====================
+# РАБОТА С WIREGUARD
+# =====================
+
+def add_peer(public_key: str, ip: str):
+    try:
+        # Ensure peer has exactly the client's IP allowed (replace previous allowed-ips)
+        run(f"wg set {WG_INTERFACE} peer {public_key} allowed-ips {ip}/32")
+        # also ensure NAT/forwarding for this client
+        add_masquerade_rule(ip)
+    except Exception as e:
+        print(f"Не удалось добавить/обновить peer: {e}")
+
+
+def remove_peer(public_key: str):
+    try:
+        run(f"wg set {WG_INTERFACE} peer {public_key} remove")
+    except Exception as e:
+        print(f"Не удалось удалить peer: {e}")
+
+
+# =====================
+# БЛОКИРОВКА / РАЗБЛОКИРОВКА
+# =====================
+
+def block_ip(ip: str):
+    try:
+        run(f"iptables -A FORWARD -s {ip} -j DROP")
+    except Exception as e:
+        print(f"Не удалось заблокировать IP {ip}: {e}")
+
+
+def unblock_ip(ip: str):
+    try:
+        run(f"iptables -D FORWARD -s {ip} -j DROP")
+    except Exception as e:
+        print(f"Не удалось разблокировать IP {ip}: {e}")
+
+
+# =====================
+# ГЕНЕРАЦИЯ КОНФИГА
+# =====================
+
+def generate_client_config(
+    client_name: str,
+    private_key: str,
+    ip: str
+):
+    # Generate preshared key for extra security
+    try:
+        preshared = run("wg genpsk")
+    except Exception:
+        # fallback: random 32 bytes base64
+        preshared = base64.b64encode(os.urandom(32)).decode()
+
+    # Additional metadata fields (matching provided template)
+    J = random.randint(1, 10)
+    Jmin = random.randint(5, 15)
+    Jmax = random.randint(30, 80)
+    S1 = random.randint(50, 150)
+    S2 = random.randint(100, 200)
+    H1 = random.randint(1_000_000_000, 2_000_000_000)
+    H2 = random.randint(1_000_000, 20_000_000)
+    H3 = random.randint(1, 999_999_999)
+    H4 = random.randint(1, 999_999_999)
+
+    dns_field = f"{SERVER_DNS}, 1.0.0.1" if SERVER_DNS else "1.1.1.1, 1.0.0.1"
+
+    config = f"""[Interface]
 Address = {ip}/32
-DNS = {SERVER_DNS}
+DNS = {dns_field}
+PrivateKey = {private_key}
+J = {J}
+Jmin = {Jmin}
+Jmax = {Jmax}
+S1 = {S1}
+S2 = {S2}
+H1 = {H1}
+H2 = {H2}
+H3 = {H3}
+H4 = {H4}
 
 [Peer]
 PublicKey = {SERVER_PUBLIC_KEY}
-PresharedKey = {psk}
+PresharedKey = {preshared}
 AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = {SERVER_ENDPOINT}
 PersistentKeepalive = 25
 """
-    path = Path(WG_DIR) / f"{name}.conf"
-    path.write_text(conf)
+
+    path = Path(WG_DIR) / f"{client_name}.conf"
+    path.write_text(config)
+    return path, config
+
+
+def save_txt_uri(client_name: str, config_text: str):
+    # Сохраняем конфиг в .txt в том же формате, что и в примере
+    path = Path(TXT_DIR) / f"{client_name}.txt"
+    path.write_text(config_text)
     return path
 
 
-# ---------------- CREATE USER ----------------
+# =====================
+# СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ
+# =====================
 
-def create_user(name, ip_index):
-    ensure_dirs()
-    clients = load_clients()
+def create_user(client_name: str, ip_index: int):
+    ensure_dir()
 
     ip = f"{BASE_IP}{ip_index}"
-    private, public, psk = generate_keys()
+    private_key, public_key = generate_keys()
 
-    add_peer(public, ip)
-    conf_path = generate_client_conf(name, private, psk, ip)
+    add_peer(public_key, ip)
+    # Настроим NAT и форвардинг для этого клиента, чтобы трафик выходил в интернет
+    try:
+        add_masquerade_rule(ip)
+    except Exception as e:
+        print(f"Ошибка при настройке NAT: {e}")
+    config_path, config_text = generate_client_config(
+        client_name,
+        private_key,
+        ip
+    )
 
-    clients[name] = {
-        "ip": ip,
-        "public_key": public,
-        "private_key": private,
-        "config": str(conf_path)
+    txt_path = save_txt_uri(client_name, config_text)
+
+    # Сохраняем запись в clients.json
+    clients = load_clients()
+    clients[client_name] = {
+        'ip': ip,
+        'public_key': public_key,
+        'private_key': private_key,
+        'config_path': str(config_path),
+        'txt_path': str(txt_path),
+        'frozen': False
     }
-
     save_clients(clients)
 
-    print("✅ Клиент создан")
+    print("✅ Пользователь создан")
     print("IP:", ip)
-    print("Public:", public)
-    print("Config:", conf_path)
+    print("Public key:", public_key)
+    print("Config:", config_path)
+    print("TXT:", txt_path)
 
 
-# ---------------- CLI ----------------
+def repair_all_clients():
+    """Применяет правильные allowed-ips и NAT/forward для всех клиентов из clients.json"""
+    clients = load_clients()
+    if not clients:
+        print("Нет клиентов в clients.json")
+        return
+    for name, info in clients.items():
+        pub = info.get('public_key')
+        ip = info.get('ip')
+        if not pub or not ip:
+            print(f"Пропускаю {name}, нет pub/ip")
+            continue
+        try:
+            run(f"wg set {WG_INTERFACE} peer {pub} allowed-ips {ip}/32")
+            add_masquerade_rule(ip)
+            print(f"Обновлён {name}: {pub} -> {ip}")
+        except Exception as e:
+            print(f"Ошибка при ремонте {name}: {e}")
+
+
+def freeze_peer_by_pubkey(pubkey: str):
+    clients = load_clients()
+    for name, info in clients.items():
+        if info.get('public_key') == pubkey:
+            ip = info.get('ip')
+            block_ip(ip)
+            # Удаляем NAT для этого клиента, если было
+            try:
+                remove_masquerade_rule(ip)
+            except Exception:
+                pass
+            info['frozen'] = True
+            save_clients(clients)
+            print(f"{name} ({ip}) заморожен")
+            return True
+    print("Клиент с таким публичным ключом не найден")
+    return False
+
+
+def unfreeze_peer_by_pubkey(pubkey: str):
+    clients = load_clients()
+    for name, info in clients.items():
+        if info.get('public_key') == pubkey:
+            ip = info.get('ip')
+            unblock_ip(ip)
+            try:
+                add_masquerade_rule(ip)
+            except Exception:
+                pass
+            info['frozen'] = False
+            save_clients(clients)
+            print(f"{name} ({ip}) разморожен")
+            return True
+    print("Клиент с таким публичным ключом не найден")
+    return False
+
+
+def freeze_peer_by_name(name: str):
+    clients = load_clients()
+    info = clients.get(name)
+    if not info:
+        print("Клиент не найден")
+        return False
+    block_ip(info['ip'])
+    info['frozen'] = True
+    save_clients(clients)
+    print(f"{name} заморожен")
+    return True
+
+
+def unfreeze_peer_by_name(name: str):
+    clients = load_clients()
+    info = clients.get(name)
+    if not info:
+        print("Клиент не найден")
+        return False
+    unblock_ip(info['ip'])
+    info['frozen'] = False
+    save_clients(clients)
+    print(f"{name} разморожен")
+    return True
+
+
+# =====================
+# ПРИМЕР ИСПОЛЬЗОВАНИЯ
+# =====================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="cmd")
+    parser = argparse.ArgumentParser(description='Manage VPN clients')
+    sub = parser.add_subparsers(dest='cmd')
 
-    c = sub.add_parser("create")
-    c.add_argument("name")
-    c.add_argument("--ip", type=int, default=START_IP)
+    create = sub.add_parser('create')
+    create.add_argument('name')
+    create.add_argument('--ip-index', type=int, default=START_IP)
+
+    freeze = sub.add_parser('freeze')
+    freeze_group = freeze.add_mutually_exclusive_group(required=True)
+    freeze_group.add_argument('--pubkey')
+    freeze_group.add_argument('--name')
+
+    unfreeze = sub.add_parser('unfreeze')
+    unfreeze_group = unfreeze.add_mutually_exclusive_group(required=True)
+    unfreeze_group.add_argument('--pubkey')
+    unfreeze_group.add_argument('--name')
+
+    repair = sub.add_parser('repair')
 
     args = parser.parse_args()
 
-    if args.cmd == "create":
-        create_user(args.name, args.ip)
+    if args.cmd == 'create':
+        create_user(args.name, args.ip_index)
+    elif args.cmd == 'repair':
+        repair_all_clients()
+    elif args.cmd == 'freeze':
+        if args.pubkey:
+            freeze_peer_by_pubkey(args.pubkey)
+        else:
+            freeze_peer_by_name(args.name)
+    elif args.cmd == 'unfreeze':
+        if args.pubkey:
+            unfreeze_peer_by_pubkey(args.pubkey)
+        else:
+            unfreeze_peer_by_name(args.name)
     else:
         parser.print_help()
